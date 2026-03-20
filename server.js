@@ -59,28 +59,28 @@ function buildCandidates(ticket, iterators, transactionId) {
   const candidates = [];
 
   const pbkdf2Cases = [
-    {
-      name: "pwd=ticket,salt=transaction_id",
-      dk: crypto.pbkdf2Sync(
-        Buffer.from(ticket, "utf8"),
-        Buffer.from(transactionId, "utf8"),
-        Number(iterators),
-        64,
-        "sha256"
-      ),
-    },
-    {
-      name: "pwd=transaction_id,salt=ticket",
-      dk: crypto.pbkdf2Sync(
-        Buffer.from(transactionId, "utf8"),
-        Buffer.from(ticket, "utf8"),
-        Number(iterators),
-        64,
-        "sha256"
-      ),
-    },
-  ];
-
+  {
+    name: "pwd=ticket,salt=transaction_id",
+    dk: crypto.pbkdf2Sync(
+      Buffer.from(ticket, "utf8"),
+      Buffer.from(transactionId, "utf8"),
+      Number(iterators),
+      64,
+      "sha1"
+    ),
+  },
+  {
+    name: "pwd=transaction_id,salt=ticket",
+    dk: crypto.pbkdf2Sync(
+      Buffer.from(transactionId, "utf8"),
+      Buffer.from(ticket, "utf8"),
+      Number(iterators),
+      64,
+      "sha1"
+    ),
+  },
+];
+  
   for (const item of pbkdf2Cases) {
     const dk = item.dk;
 
