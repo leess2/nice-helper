@@ -58,67 +58,46 @@ function decryptEncData(encData, keyBuf) {
 function buildCandidates(ticket, iterators, transactionId) {
   const candidates = [];
 
-  const pbkdf2Cases = [
-  {
-    name: "pwd=ticket,salt=transaction_id",
-    dk: crypto.pbkdf2Sync(
-      Buffer.from(ticket, "utf8"),
-      Buffer.from(transactionId, "utf8"),
-      Number(iterators),
-      64,
-      "sha1"
-    ),
-  },
-  {
-    name: "pwd=transaction_id,salt=ticket",
-    dk: crypto.pbkdf2Sync(
-      Buffer.from(transactionId, "utf8"),
-      Buffer.from(ticket, "utf8"),
-      Number(iterators),
-      64,
-      "sha1"
-    ),
-  },
-];
-  
-  for (const item of pbkdf2Cases) {
-    const dk = item.dk;
+  // 문서 정답 조합
+  const dk = crypto.pbkdf2Sync(
+    Buffer.from(ticket, "utf8"),
+    Buffer.from(transactionId, "utf8"),
+    Number(iterators),
+    64,
+    "sha256"
+  );
 
-    // 1) raw byte 기준 추출
-    candidates.push({
-      mode: `${item.name} / raw[0:32]+raw[32:64]`,
-      keyBuf: dk.subarray(0, 32),
-      hmacKey: dk.subarray(32, 64),
-    });
+  const kdfValue = toBase64UrlNoPadding(dk);
 
-    // 2) raw byte 기준, 문서의 "48번째부터 32byte" 해석
-    // 1-base 48번째 => 0-base index 47, 끝은 79까지지만 64byte 한계 내에서 잘림
-    candidates.push({
-      mode: `${item.name} / raw[0:32]+raw[47:64]`,
-      keyBuf: dk.subarray(0, 32),
-      hmacKey: dk.subarray(47, 64),
-    });
+  const keyStr32 = kdfValue.slice(0, 32);
 
-    // 3) base64url 문자열 기준 추출
-    const kdfValue = toBase64UrlNoPadding(dk);
-    const keyStr32 = kdfValue.slice(0, 32);
-    const hmacStr32_from33 = kdfValue.slice(32, 64);
-    const hmacStr32_from48 = kdfValue.slice(47, 79);
+  // 문서 "48번째부터 32byte" 기준
+  const hmacStr32_from48 = kdfValue.slice(48, 80);
 
-    candidates.push({
-      mode: `${item.name} / str[0:32]+str[32:64]`,
-      keyBuf: Buffer.from(keyStr32, "utf8"),
-      hmacKey: Buffer.from(hmacStr32_from33, "utf8"),
-      debug: { kdfValue, keyStr32, hmacStr32_from33 },
-    });
+  candidates.push({
+    mode: "doc-final / str[0:32] + str[48:80]",
+    keyBuf: Buffer.from(keyStr32, "utf8"),
+    hmacKey: Buffer.from(hmacStr32_from48, "utf8"),
+    debug: {
+      kdfValue,
+      keyStr32,
+      hmacStr32_from48
+    }
+  });
 
-    candidates.push({
-      mode: `${item.name} / str[0:32]+str[47:79]`,
-      keyBuf: Buffer.from(keyStr32, "utf8"),
-      hmacKey: Buffer.from(hmacStr32_from48, "utf8"),
-      debug: { kdfValue, keyStr32, hmacStr32_from48 },
-    });
-  }
+  // 비교용으로 하나만 더 두자 (혹시 문서 해석 차이 대비)
+  const hmacStr32_from47 = kdfValue.slice(47, 79);
+
+  candidates.push({
+    mode: "doc-check / str[0:32] + str[47:79]",
+    keyBuf: Buffer.from(keyStr32, "utf8"),
+    hmacKey: Buffer.from(hmacStr32_from47, "utf8"),
+    debug: {
+      kdfValue,
+      keyStr32,
+      hmacStr32_from47
+    }
+  });
 
   return candidates;
 }
