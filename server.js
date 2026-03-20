@@ -18,57 +18,15 @@ function fromBase64Url(str) {
   return Buffer.from(normalized + padding, "base64");
 }
 
-/*
- * NICE 문서 기준:
- * 1) PBKDF2로 "문자열" kdfValue 생성
- * 2) 앞 32byte = key
- * 3) 48번째부터 32byte = hmacKey
- *
- * 주의:
- * "48번째부터"는 1-base 표현이므로 JS에서는 index 47부터 slice
- */
-function deriveKdfValue(ticket, iterators, transactionId) {
-  // 문서 흐름상 ticket + iterators + transaction_id를 사용
-  // PBEKeySpec 스타일에 맞춰 ticket을 password, transaction_id를 salt로 사용
-  const dk = crypto.pbkdf2Sync(
-    Buffer.from(ticket, "utf8"),
-    Buffer.from(transactionId, "utf8"),
-    Number(iterators),
-    64,
-    "sha256"
-  );
-
-  // 문서에서 문자열 기반으로 잘라 쓰므로 base64url 문자열화
-  return toBase64UrlNoPadding(dk);
+function hmacBase64Url(value, hmacKey) {
+  const digest = crypto.createHmac("sha256", hmacKey).update(value, "utf8").digest();
+  return toBase64UrlNoPadding(digest);
 }
 
-function deriveKeys(ticket, iterators, transactionId) {
-  const kdfValue = deriveKdfValue(ticket, iterators, transactionId);
-
-  const keyStr = kdfValue.slice(0, 32);
-  const hmacKeyStr = kdfValue.slice(47, 79); // 48번째부터 32byte
-
-  return {
-    kdfValue,
-    keyStr,
-    hmacKeyStr,
-    key: Buffer.from(keyStr, "utf8"),
-  };
-}
-
-function verifyIntegrity(encData, hmacKeyStr, integrityValue) {
-  const digest = crypto.createHmac("sha256", hmacKeyStr).update(encData, "utf8").digest();
-  const calc = toBase64UrlNoPadding(digest);
-  return {
-    ok: calc === integrityValue,
-    calc,
-  };
-}
-
-function decryptEncData(encData, key) {
+function decryptEncData(encData, keyBuf) {
   const cipherEnc = fromBase64Url(encData);
 
-  // 문서 기준: enc_data 디코딩 결과 앞 16byte = IV
+  // NICE 문서: enc_data 디코딩 결과 앞 16byte = IV
   const iv = cipherEnc.subarray(0, 16);
   const cipherAndTag = cipherEnc.subarray(16);
 
@@ -80,7 +38,7 @@ function decryptEncData(encData, key) {
   const cipherText = cipherAndTag.subarray(0, cipherLen);
   const tag = cipherAndTag.subarray(cipherLen);
 
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", keyBuf, iv);
   decipher.setAuthTag(tag);
 
   const plain = Buffer.concat([
@@ -89,6 +47,104 @@ function decryptEncData(encData, key) {
   ]);
 
   return plain.toString("utf8");
+}
+
+/**
+ * 후보 KDF 조합 자동 탐색
+ * - PBKDF2(password, salt, iterators, 64, sha256)
+ * - NICE 문서상 key/hmacKey 추출 규칙이 표현상 애매해서 후보를 전부 시도
+ * - integrity_value가 맞는 조합만 채택
+ */
+function buildCandidates(ticket, iterators, transactionId) {
+  const candidates = [];
+
+  const pbkdf2Cases = [
+    {
+      name: "pwd=ticket,salt=transaction_id",
+      dk: crypto.pbkdf2Sync(
+        Buffer.from(ticket, "utf8"),
+        Buffer.from(transactionId, "utf8"),
+        Number(iterators),
+        64,
+        "sha256"
+      ),
+    },
+    {
+      name: "pwd=transaction_id,salt=ticket",
+      dk: crypto.pbkdf2Sync(
+        Buffer.from(transactionId, "utf8"),
+        Buffer.from(ticket, "utf8"),
+        Number(iterators),
+        64,
+        "sha256"
+      ),
+    },
+  ];
+
+  for (const item of pbkdf2Cases) {
+    const dk = item.dk;
+
+    // 1) raw byte 기준 추출
+    candidates.push({
+      mode: `${item.name} / raw[0:32]+raw[32:64]`,
+      keyBuf: dk.subarray(0, 32),
+      hmacKey: dk.subarray(32, 64),
+    });
+
+    // 2) raw byte 기준, 문서의 "48번째부터 32byte" 해석
+    // 1-base 48번째 => 0-base index 47, 끝은 79까지지만 64byte 한계 내에서 잘림
+    candidates.push({
+      mode: `${item.name} / raw[0:32]+raw[47:64]`,
+      keyBuf: dk.subarray(0, 32),
+      hmacKey: dk.subarray(47, 64),
+    });
+
+    // 3) base64url 문자열 기준 추출
+    const kdfValue = toBase64UrlNoPadding(dk);
+    const keyStr32 = kdfValue.slice(0, 32);
+    const hmacStr32_from33 = kdfValue.slice(32, 64);
+    const hmacStr32_from48 = kdfValue.slice(47, 79);
+
+    candidates.push({
+      mode: `${item.name} / str[0:32]+str[32:64]`,
+      keyBuf: Buffer.from(keyStr32, "utf8"),
+      hmacKey: Buffer.from(hmacStr32_from33, "utf8"),
+      debug: { kdfValue, keyStr32, hmacStr32_from33 },
+    });
+
+    candidates.push({
+      mode: `${item.name} / str[0:32]+str[47:79]`,
+      keyBuf: Buffer.from(keyStr32, "utf8"),
+      hmacKey: Buffer.from(hmacStr32_from48, "utf8"),
+      debug: { kdfValue, keyStr32, hmacStr32_from48 },
+    });
+  }
+
+  return candidates;
+}
+
+function findMatchingCandidate(ticket, iterators, transactionId, encData, integrityValue) {
+  const candidates = buildCandidates(ticket, iterators, transactionId);
+
+  for (const c of candidates) {
+    const calc = hmacBase64Url(encData, c.hmacKey);
+    if (calc === integrityValue) {
+      return {
+        ok: true,
+        candidate: c,
+        calc,
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    tried: candidates.map((c) => ({
+      mode: c.mode,
+      calc: hmacBase64Url(encData, c.hmacKey),
+      debug: c.debug || null,
+    })),
+  };
 }
 
 app.get("/health", (req, res) => {
@@ -112,24 +168,24 @@ app.post("/nice/decrypt", (req, res) => {
       });
     }
 
-    const { kdfValue, keyStr, hmacKeyStr, key } = deriveKeys(ticket, iterators, transaction_id);
+    const matched = findMatchingCandidate(
+      ticket,
+      iterators,
+      transaction_id,
+      enc_data,
+      integrity_value
+    );
 
-    const verify = verifyIntegrity(enc_data, hmacKeyStr, integrity_value);
-    if (!verify.ok) {
+    if (!matched.ok) {
       return res.status(400).json({
         ok: false,
         msg: "integrity mismatch",
-        calc: verify.calc,
         recv: integrity_value,
-        debug: {
-          kdfValue,
-          keyStr,
-          hmacKeyStr
-        }
+        tried: matched.tried,
       });
     }
 
-    const plain = decryptEncData(enc_data, key);
+    const plain = decryptEncData(enc_data, matched.candidate.keyBuf);
 
     let parsed;
     try {
@@ -138,13 +194,14 @@ app.post("/nice/decrypt", (req, res) => {
       return res.status(200).json({
         ok: false,
         msg: "json parse fail after decrypt",
+        mode: matched.candidate.mode,
         plain,
       });
     }
 
     return res.json({
       ok: true,
-      plain,
+      mode: matched.candidate.mode,
       data: parsed,
     });
   } catch (err) {
